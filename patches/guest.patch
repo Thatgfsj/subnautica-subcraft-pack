@@ -1,0 +1,325 @@
+﻿diff --git a/guest-neoforge/build.gradle b/guest-neoforge/build.gradle
+index 6f295a3..c7a83e6 100644
+--- a/guest-neoforge/build.gradle
++++ b/guest-neoforge/build.gradle
+@@ -20,7 +20,9 @@ neoForge {
+ 			systemProperty 'forge.logging.markers', 'REGISTRIES'
+ 			logLevel = org.slf4j.event.Level.INFO
+ 			// Dev profile for an 8 GB machine (MISSION.md section 2).
+-			jvmArguments.addAll('-Xmx2G', '-XX:+UseG1GC')
++			// Local patch (thatg's PC, 2026-10-09): this box has 64 GB; 2 GB was hitting its cap
++			// (diag showed heap 1900/2048 MB, fps dipping to ~55). 6 GB leaves headroom.
++			jvmArguments.addAll('-Xmx6G', '-XX:+UseG1GC')
+ 		}
+ 		client {
+ 			client()
+diff --git a/guest-neoforge/src/main/java/dev/subcraft/SubCraft.java b/guest-neoforge/src/main/java/dev/subcraft/SubCraft.java
+index 470db7f..b6b0e47 100644
+--- a/guest-neoforge/src/main/java/dev/subcraft/SubCraft.java
++++ b/guest-neoforge/src/main/java/dev/subcraft/SubCraft.java
+@@ -28,6 +28,7 @@ public final class SubCraft {
+ 
+ 	public SubCraft(IEventBus modBus) {
+ 		SubBlocks.register(modBus);
++		dev.subcraft.items.SubItems.register(modBus);
+ 		dev.subcraft.combat.SubEntities.register(modBus);
+ 		dev.subcraft.world.ghost.ChunkGhostData.register(modBus);
+ 		NeoForge.EVENT_BUS.addListener((net.neoforged.neoforge.event.level.ChunkEvent.Load e) -> {
+@@ -49,6 +50,7 @@ public final class SubCraft {
+ 		NeoForge.EVENT_BUS.addListener((PlayerTickEvent.Post e) -> holdBreath(e.getEntity()));
+ 		NeoForge.EVENT_BUS.addListener(SubCraft::spawnOnlyOnKnownTerrain);
+ 		NeoForge.EVENT_BUS.addListener(SubCraft::logPlayerDamage);
++		NeoForge.EVENT_BUS.addListener(SubCraft::noVoidDeathWhileLinked);
+ 		NeoForge.EVENT_BUS.addListener(SubCraft::freezeOnUnknownTerrain);
+ 	}
+ 
+@@ -101,6 +103,27 @@ public final class SubCraft {
+ 		}
+ 	}
+ 
++	/**
++	 * Local patch (thatg's PC, 2026-10-09). The dev world spans y = -2032..255 with the water column
++	 * below y = 0, so a Minecraft respawn used to land under the water and fall out of the world,
++	 * dying of "outOfWorld" over and over. The host now anchors Minecraft's spawn at Subnautica's own
++	 * spawn point (host WorldAnchor), and while the host owns death (MISSION.md 3.4) a void death in
++	 * the SubCraft world is never the right outcome: cancel it and put the player back at the surface.
++	 */
++	private static void noVoidDeathWhileLinked(net.neoforged.neoforge.event.entity.living.LivingIncomingDamageEvent event) {
++		if (!(event.getEntity() instanceof ServerPlayer player) || !SubWorld.is(player.level()) || !SubLink.active()) {
++			return;
++		}
++		if (!"outOfWorld".equals(event.getSource().getMsgId())) {
++			return;
++		}
++		event.setCanceled(true);
++		player.resetFallDistance();
++		double safeY = Math.max(player.getY(), 2.0);
++		player.teleportTo(player.getX(), safeY, player.getZ());
++		LOG.warn("SubCraft: cancelled an out-of-world death and lifted the player to y={}", safeY);
++	}
++
+ 	/** Every hurt of the player in the SubCraft world, with its source: health loss always needs explaining. */
+ 	private static void logPlayerDamage(net.neoforged.neoforge.event.entity.living.LivingDamageEvent.Post e) {
+ 		if (e.getEntity() instanceof ServerPlayer p && SubWorld.is(p.level())) {
+diff --git a/guest-neoforge/src/main/java/dev/subcraft/client/DevWorld.java b/guest-neoforge/src/main/java/dev/subcraft/client/DevWorld.java
+index 28c2d30..f3f5fc8 100644
+--- a/guest-neoforge/src/main/java/dev/subcraft/client/DevWorld.java
++++ b/guest-neoforge/src/main/java/dev/subcraft/client/DevWorld.java
+@@ -52,7 +52,12 @@ public final class DevWorld {
+ 		}
+ 		SubCraft.LOG.info("SubCraft: creating world '{}'", name);
+ 		GameRules rules = new GameRules();
+-		LevelSettings settings = new LevelSettings(name, GameType.SURVIVAL, false, Difficulty.NORMAL, true, rules, WorldDataConfiguration.DEFAULT);
++		// Local patch (thatg's PC, 2026-10-09): upstream created the dev world in SURVIVAL while
++		// docs/TESTING.md says both sides start Creative, so E opened the survival screen with no
++		// item palette and the player could not take blocks. Creative matches the documented dev
++		// profile (TESTING.md "The dev game is Creative, and the Minecraft dev world starts in
++		// Creative too"). Revert to GameType.SURVIVAL if upstream fixes the mismatch differently.
++		LevelSettings settings = new LevelSettings(name, GameType.CREATIVE, false, Difficulty.NORMAL, true, rules, WorldDataConfiguration.DEFAULT);
+ 		minecraft.createWorldOpenFlows().createFreshLevel(
+ 			name,
+ 			settings,
+diff --git a/guest-neoforge/src/main/java/dev/subcraft/client/SubClient.java b/guest-neoforge/src/main/java/dev/subcraft/client/SubClient.java
+index 2ce4ab7..8fcd16b 100644
+--- a/guest-neoforge/src/main/java/dev/subcraft/client/SubClient.java
++++ b/guest-neoforge/src/main/java/dev/subcraft/client/SubClient.java
+@@ -48,6 +48,8 @@ public final class SubClient {
+ 	private static LocalPlayer deadPlayer;
+ 	private static Vec3 holdPos;
+ 	private static long holdSinceMs;
++	/** Local patch (thatg's PC, 2026-10-09): wall-clock start of a hold, never reset while it lasts. */
++	private static long holdWaitMs;
+ 	private static LocalPlayer eyePlayer;
+ 	private static float eyeSmoothed;
+ 	private static long frameCounter;
+@@ -230,12 +232,18 @@ public final class SubClient {
+ 		}
+ 		if (!host.inGame() || host.loading()) {
+ 			if (holdPos == null) {
+-				holdPos = player.position();
++				Vec3 at = player.position();
++				// Local patch (thatg's PC, 2026-10-09): while the host sits at a menu or a loading screen
++				// nothing should be happening to the player, but the world below the water column is
++				// empty, so pinning them where they are means sinking out of the world. Idle at the
++				// surface instead; the host anchors the real spawn once it is in game.
++				holdPos = new Vec3(at.x, Math.max(at.y, 2.0), at.z);
+ 			}
+ 			teleportPending = true;
+ 		}
+ 		if (holdPos == null) {
+ 			holdSinceMs = 0;
++			holdWaitMs = 0;
+ 			return;
+ 		}
+ 		// Nothing counts until the destination chunk has reached the client: an unloaded chunk reads
+@@ -246,12 +254,32 @@ public final class SubClient {
+ 		} else if (holdSinceMs == 0) {
+ 			holdSinceMs = System.currentTimeMillis();
+ 		}
++		if (holdWaitMs == 0) {
++			holdWaitMs = System.currentTimeMillis();
++		}
+ 		boolean ground = chunkLoaded && hasTerrainBelow(minecraft, holdPos, 12);
+ 		boolean water = chunkLoaded && !minecraft.level.getFluidState(BlockPos.containing(holdPos)).isEmpty();
++		// Local patch (thatg's PC, 2026-10-09). The Crater Edge and open water are the reported
++		// "movement stops and you sink": the host describes those sections (or never describes them),
++		// there is no ground to wait for, so the old rule pinned the player for up to 6 s per teleport —
++		// and forever when the destination chunk never loaded, because the wait timer restarted every
++		// tick. Release when the host says the space is described and has no ground, or after a
++		// wall-clock cap that does not care whether the chunk ever arrives.
++		boolean describedEmpty = chunkLoaded
++			&& dev.subcraft.world.tri.TriStore.isKnown((int) Math.floor(holdPos.x), (int) Math.floor(holdPos.y), (int) Math.floor(holdPos.z))
++			&& !ground;
+ 		boolean timedOut = chunkLoaded && System.currentTimeMillis() - holdSinceMs > 6000;
+-		if ((ground || water || timedOut) && host.inGame() && !host.loading()) {
+-			SubCraft.LOG.info("SubCraft: released player at {} ({})", holdPos, ground ? "ground below" : water ? "in water" : "timed out waiting for ground");
++		boolean waitedTooLong = System.currentTimeMillis() - holdWaitMs > 4000;
++		if ((ground || water || describedEmpty || timedOut || waitedTooLong) && host.inGame() && !host.loading()) {
++			SubCraft.LOG.info("SubCraft: released player at {} ({})", holdPos,
++				ground ? "ground below"
++					: water ? "in water"
++					: describedEmpty ? "host describes no ground here"
++					: timedOut ? "timed out waiting for ground"
++					: "waited too long for the chunk");
+ 			holdPos = null;
++			holdSinceMs = 0;
++			holdWaitMs = 0;
+ 			return;
+ 		}
+ 		player.setDeltaMovement(Vec3.ZERO);
+@@ -289,6 +317,7 @@ public final class SubClient {
+ 		player.setDeltaMovement(Vec3.ZERO);
+ 		player.resetFallDistance();
+ 		holdSinceMs = 0; // a new hold: wait for this destination's chunk and ground
++		holdWaitMs = 0;
+ 		var server = minecraft.getSingleplayerServer();
+ 		if (server != null) {
+ 			var uuid = player.getUUID();
+@@ -448,11 +477,27 @@ public final class SubClient {
+ 	}
+ 
+ 	private static void hideWindowOnce(Minecraft minecraft) {
+-		if (windowHidden || SHOW_WINDOW) {
++		if (SHOW_WINDOW) {
++			return;
++		}
++		long window = minecraft.getWindow().getWindow();
++		// Local patch (thatg's PC, 2026-10-09): upstream hid the window once, so anything that
++		// showed it again (F11 / Minecraft's fullscreen toggle) left the raw Minecraft window on
++		// top of Subnautica forever. Re-assert the hidden state every tick instead.
++		boolean visible = GLFW.glfwGetWindowAttrib(window, GLFW.GLFW_VISIBLE) != GLFW.GLFW_FALSE;
++		if (visible) {
++			GLFW.glfwHideWindow(window);
++			if (!windowHidden) {
++				SubCraft.LOG.info("SubCraft: a key or mod showed Minecraft's window while linked; hid it again");
++			}
++		}
++		if (windowHidden) {
+ 			return;
+ 		}
+ 		windowHidden = true;
+-		GLFW.glfwHideWindow(minecraft.getWindow().getWindow());
++		if (!visible) {
++			GLFW.glfwHideWindow(window);
++		}
+ 		SubCraft.LOG.info("SubCraft: game window hidden (run with -Dsubcraft.showWindow=true to keep it)");
+ 	}
+ 
+diff --git a/guest-neoforge/src/main/java/dev/subcraft/items/SubItems.java b/guest-neoforge/src/main/java/dev/subcraft/items/SubItems.java
+new file mode 100644
+index 0000000..53f06c7
+--- /dev/null
++++ b/guest-neoforge/src/main/java/dev/subcraft/items/SubItems.java
+@@ -0,0 +1,31 @@
++package dev.subcraft.items;
++
++import dev.subcraft.SubCraft;
++import net.minecraft.world.item.Item;
++import net.neoforged.bus.api.IEventBus;
++import net.neoforged.neoforge.registries.DeferredItem;
++import net.neoforged.neoforge.registries.DeferredRegister;
++
++/**
++ * The item bridge's Minecraft side (MISSION.md Phase 6, first slice).
++ *
++ * Subnautica owns pickups, so one Minecraft item stands in for every Subnautica TechType instead of
++ * one registered item per type (Minecraft registers items at mod construction, long before the host
++ * tells us which TechTypes exist). The type and its localized name ride along in
++ * {@code minecraft:custom_data}, which needs no registration and survives saving and syncing:
++ *
++ * <pre>/give @s subcraft:subnautica_item[minecraft:custom_data={subcraft_tech:"Peeper",subcraft_label:"眼鱼"}] 2</pre>
++ */
++public final class SubItems {
++	private static final DeferredRegister.Items ITEMS = DeferredRegister.createItems(SubCraft.MOD_ID);
++
++	public static final DeferredItem<SubnauticaItem> SUBNAUTICA_ITEM =
++		ITEMS.register("subnautica_item", () -> new SubnauticaItem(new Item.Properties()));
++
++	private SubItems() {
++	}
++
++	public static void register(IEventBus modBus) {
++		ITEMS.register(modBus);
++	}
++}
+diff --git a/guest-neoforge/src/main/java/dev/subcraft/items/SubnauticaItem.java b/guest-neoforge/src/main/java/dev/subcraft/items/SubnauticaItem.java
+new file mode 100644
+index 0000000..6dccfa4
+--- /dev/null
++++ b/guest-neoforge/src/main/java/dev/subcraft/items/SubnauticaItem.java
+@@ -0,0 +1,58 @@
++package dev.subcraft.items;
++
++import java.util.List;
++import net.minecraft.ChatFormatting;
++import net.minecraft.core.component.DataComponents;
++import net.minecraft.nbt.CompoundTag;
++import net.minecraft.network.chat.Component;
++import net.minecraft.world.item.Item;
++import net.minecraft.world.item.ItemStack;
++import net.minecraft.world.item.TooltipFlag;
++import net.minecraft.world.item.component.CustomData;
++
++/**
++ * A Subnautica item, as Minecraft sees it: one item id, the TechType and its localized name in
++ * {@code minecraft:custom_data} (written by the host through the link's command box).
++ */
++public class SubnauticaItem extends Item {
++	/** Keys inside minecraft:custom_data; the host writes them. */
++	public static final String TECH_KEY = "subcraft_tech";
++	public static final String LABEL_KEY = "subcraft_label";
++
++	public SubnauticaItem(Properties properties) {
++		super(properties);
++	}
++
++	@Override
++	public Component getName(ItemStack stack) {
++		CompoundTag tag = data(stack);
++		if (tag != null) {
++			String label = tag.getString(LABEL_KEY);
++			if (!label.isEmpty()) {
++				return Component.literal(label);
++			}
++			String tech = tag.getString(TECH_KEY);
++			if (!tech.isEmpty()) {
++				return Component.literal(tech);
++			}
++		}
++		return super.getName(stack);
++	}
++
++	@Override
++	public void appendHoverText(ItemStack stack, TooltipContext context, List<Component> tooltip, TooltipFlag flag) {
++		CompoundTag tag = data(stack);
++		if (tag == null) {
++			return;
++		}
++		String tech = tag.getString(TECH_KEY);
++		if (!tech.isEmpty()) {
++			tooltip.add(Component.literal(tech).withStyle(ChatFormatting.DARK_GRAY));
++		}
++	}
++
++	private static CompoundTag data(ItemStack stack) {
++		CustomData custom = stack.get(DataComponents.CUSTOM_DATA);
++		return custom == null ? null : custom.copyTag();
++	}
++}
+diff --git a/guest-neoforge/src/main/resources/assets/subcraft/lang/en_us.json b/guest-neoforge/src/main/resources/assets/subcraft/lang/en_us.json
+index 07c17c4..1745cf5 100644
+--- a/guest-neoforge/src/main/resources/assets/subcraft/lang/en_us.json
++++ b/guest-neoforge/src/main/resources/assets/subcraft/lang/en_us.json
+@@ -22,5 +22,6 @@
+   "biome.subcraft.lava_zone": "Lava Zone",
+   "biome.subcraft.floating_island": "Floating Island",
+   "biome.subcraft.crater_edge": "Crater Edge",
+-  "biome.subcraft.precursor": "Precursor"
++  "biome.subcraft.precursor": "Precursor",
++  "item.subcraft.subnautica_item": "Subnautica Item"
+ }
+diff --git a/guest-neoforge/src/main/resources/assets/subcraft/models/item/subnautica_item.json b/guest-neoforge/src/main/resources/assets/subcraft/models/item/subnautica_item.json
+new file mode 100644
+index 0000000..05ce9f6
+--- /dev/null
++++ b/guest-neoforge/src/main/resources/assets/subcraft/models/item/subnautica_item.json
+@@ -0,0 +1,6 @@
++{
++  "parent": "minecraft:item/generated",
++  "textures": {
++    "layer0": "subcraft:item/subnautica_item"
++  }
++}
+diff --git a/guest-neoforge/src/main/resources/assets/subcraft/textures/item/subnautica_item.png b/guest-neoforge/src/main/resources/assets/subcraft/textures/item/subnautica_item.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..e531ff720b7aca31215319055afaabdcbac7b18b
+GIT binary patch
+literal 167
+zcmeAS@N?(olHy`uVBq!ia0vp^0wB!61|;P_|4#%`jKx9jP7LeL$-D$|SkfJR9T^xl
+z_H+M9WCij$3p^r=85sBugD~Uq{1qucK^spO#}Etu<Odr+{`TigV-WPZ95%7FeKBKx
+z-CuRC%l8;2uCOt1yWWw<@s>xSg|n(r;8-TZ$_fif2TnGIipI95J3^BqfaWlGy85}S
+Ib4q9e0PZ3&IsgCw
+
+literal 0
+HcmV?d00001
+

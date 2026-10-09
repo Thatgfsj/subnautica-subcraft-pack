@@ -1,0 +1,521 @@
+﻿diff --git a/host-subnautica/src/Dev/DevHarness.cs b/host-subnautica/src/Dev/DevHarness.cs
+index ec2eaf7..cd7baa1 100644
+--- a/host-subnautica/src/Dev/DevHarness.cs
++++ b/host-subnautica/src/Dev/DevHarness.cs
+@@ -364,6 +364,10 @@ namespace SubCraft.Dev
+ 					case "quit":
+ 						Application.Quit();
+ 						break;
++					case "itemsync":
++						// Item bridge: grant everything currently in Subnautica's inventory to Minecraft.
++						msg = "queued " + Items.ItemBridge.SyncAll(LinkDriver.Instance.Link.View) + " item(s)";
++						break;
+ 					default:
+ 						ok = false;
+ 						msg = "unknown command";
+diff --git a/host-subnautica/src/Items/ItemBridge.cs b/host-subnautica/src/Items/ItemBridge.cs
+new file mode 100644
+index 0000000..ade4da2
+--- /dev/null
++++ b/host-subnautica/src/Items/ItemBridge.cs
+@@ -0,0 +1,219 @@
++using System;
++using System.Collections.Generic;
++using System.Text;
++using SubCraft.Link;
++using UnityEngine;
++
++namespace SubCraft.Items
++{
++	/// <summary>
++	/// Subnautica -> Minecraft item bridge (MISSION.md Phase 6, first slice).
++	///
++	/// Subnautica owns pickups, so a fish you catch lives in Subnautica's inventory and Minecraft's
++	/// never sees it. While linked this watches Subnautica's inventory and, for every item gained,
++	/// asks the guest to hand over the matching Minecraft item through the link's command box:
++	///
++	///     /give @s subcraft:subnautica_item[subcraft:tech_type="Peeper",subcraft:label="眼鱼"] 2
++	///
++	/// Items already in the inventory when the link comes up are NOT granted (a fresh session would
++	/// otherwise dump the whole back catalogue into Minecraft); the harness command "itemsync" does
++	/// that on demand.
++	///
++	/// v1 is a copy, not a move: the Subnautica item stays where it was, so the two inventories can
++	/// show the same pickaxe. Turn that into a move once a Minecraft -> Subnautica path exists
++	/// (fabricator direction is still an open question in MISSION.md section 9.3).
++	/// </summary>
++	public static class ItemBridge
++	{
++		private const float PollSeconds = 0.5f;
++
++		private static readonly Dictionary<string, TechType> kinds = new Dictionary<string, TechType>();
++		private static readonly Dictionary<string, int> now = new Dictionary<string, int>();
++		private static readonly Dictionary<string, int> last = new Dictionary<string, int>();
++		private static float nextPoll;
++		private static bool primed;
++
++		/// <summary>Commands actually handed to Minecraft this session (harness/status reads it).</summary>
++		public static int GrantedTotal { get; private set; }
++		public static string LastGrant { get; private set; }
++
++		public static void Reset()
++		{
++			kinds.Clear();
++			now.Clear();
++			last.Clear();
++			primed = false;
++		}
++
++		/// <summary>Called once per host frame. Cheap when nothing changed: a dictionary walk every 0.5 s.</summary>
++		public static void Frame(LinkView view, bool inGame)
++		{
++			if (view == null)
++			{
++				return;
++			}
++			if (!inGame)
++			{
++				if (primed)
++				{
++					Reset();
++				}
++				return;
++			}
++
++			float nowSeconds = Time.realtimeSinceStartup;
++			if (nowSeconds < nextPoll)
++			{
++				return;
++			}
++			nextPoll = nowSeconds + PollSeconds;
++
++			Snapshot();
++			if (!primed)
++			{
++				primed = true;
++				Copy(now, last);
++				Plugin.Log.LogInfo("SubCraft items: watching " + now.Count + " kind(s) already in the inventory");
++				return;
++			}
++			foreach (var kv in now)
++			{
++				int before;
++				last.TryGetValue(kv.Key, out before);
++				if (kv.Value > before)
++				{
++					Enqueue(kv.Key, kv.Value - before);
++				}
++			}
++			Copy(now, last);
++		}
++
++		/// <summary>Harness "itemsync": grant everything currently in Subnautica's inventory.</summary>
++		public static int SyncAll(LinkView view)
++		{
++			if (view == null)
++			{
++				return 0;
++			}
++			Snapshot();
++			int n = 0;
++			foreach (var kv in now)
++			{
++				Enqueue(kv.Key, kv.Value);
++				n += kv.Value;
++			}
++			Copy(now, last);
++			primed = true;
++			Plugin.Log.LogInfo("SubCraft items: itemsync queued " + Link.GuestCommands.Queued + " command(s) for " + n + " item(s)");
++			return n;
++		}
++
++		// ---- internals -------------------------------------------------------------------------
++
++		private static void Snapshot()
++		{
++			now.Clear();
++			Inventory inv = Inventory.main;
++			if (inv == null)
++			{
++				return;
++			}
++			ItemsContainer container = inv.container;
++			if (container == null)
++			{
++				return;
++			}
++			foreach (InventoryItem item in container)
++			{
++				if (item == null)
++				{
++					continue;
++				}
++				TechType tech = item.techType;
++				string key = Name(tech);
++				if (!kinds.ContainsKey(key))
++				{
++					kinds[key] = tech;
++				}
++				if (!now.ContainsKey(key))
++				{
++					// GetPickupCount sees stacked items; the container walk only gives kinds.
++					now[key] = inv.GetPickupCount(tech);
++				}
++			}
++		}
++
++		private static void Enqueue(string key, int count)
++		{
++			if (count <= 0)
++			{
++				return;
++			}
++			TechType tech;
++			if (!kinds.TryGetValue(key, out tech))
++			{
++				return;
++			}
++			string label = key;
++			try
++			{
++				string localized = Language.main != null ? Language.main.Get(key) : null;
++				if (!string.IsNullOrEmpty(localized))
++				{
++					label = localized;
++				}
++			}
++			catch (Exception e)
++			{
++				Plugin.Log.LogWarning("SubCraft items: no localized name for " + key + ": " + e.Message);
++			}
++			// minecraft:custom_data needs no registration on the guest side and survives saving and
++			// syncing, so one item id carries every TechType (see guest SubnauticaItem).
++			string cmd = "/give @s subcraft:subnautica_item[minecraft:custom_data={subcraft_tech:\"" + Clean(key) +
++				"\",subcraft_label:\"" + Clean(label) + "\"}] " + count;
++			Link.GuestCommands.Enqueue(cmd);
++			GrantedTotal++;
++			LastGrant = cmd;
++		}
++
++		private static string Name(TechType tech)
++		{
++			try
++			{
++				return TechTypeExtensions.AsString(tech, false);
++			}
++			catch (Exception)
++			{
++				return tech.ToString();
++			}
++		}
++
++		/// <summary>Keeps the text inside one command argument: no quotes, backslashes or control chars.</summary>
++		private static string Clean(string s)
++		{
++			if (string.IsNullOrEmpty(s))
++			{
++				return "?";
++			}
++			StringBuilder sb = new StringBuilder(s.Length);
++			foreach (char c in s)
++			{
++				if (c == '"' || c == '\\' || c < ' ')
++				{
++					continue;
++				}
++				sb.Append(c);
++			}
++			return sb.Length == 0 ? "?" : sb.ToString();
++		}
++
++		private static void Copy(Dictionary<string, int> from, Dictionary<string, int> to)
++		{
++			to.Clear();
++			foreach (var kv in from)
++			{
++				to[kv.Key] = kv.Value;
++			}
++		}
++	}
++}
+diff --git a/host-subnautica/src/Link/GuestCommands.cs b/host-subnautica/src/Link/GuestCommands.cs
+new file mode 100644
+index 0000000..cc6da66
+--- /dev/null
++++ b/host-subnautica/src/Link/GuestCommands.cs
+@@ -0,0 +1,67 @@
++using System.Collections.Generic;
++using SubCraft.Link;
++
++namespace SubCraft.Link
++{
++	/// <summary>
++	/// One queue for host -> Minecraft commands (protocol command box, v12). Several host systems want
++	/// to send commands (the item bridge, the spawn anchor, ...) but the box has a single slot and the
++	/// guest acks one at a time, so they all enqueue here and <see cref="Frame"/> pushes the next one.
++	///
++	/// Added 2026-10-09 (thatg's PC) with the item bridge; previously nothing on the host wrote the box.
++	/// </summary>
++	public static class GuestCommands
++	{
++		private static readonly Queue<string> waiting = new Queue<string>();
++		private static string inFlight;
++
++		public static int Queued => waiting.Count + (inFlight != null ? 1 : 0);
++
++		public static void Enqueue(string command)
++		{
++			if (string.IsNullOrEmpty(command))
++			{
++				return;
++			}
++			waiting.Enqueue(command);
++		}
++
++		public static void Reset()
++		{
++			waiting.Clear();
++			inFlight = null;
++		}
++
++		/// <summary>Pushes at most one command per frame; retries while the box is busy.</summary>
++		public static void Frame(LinkView view, bool linked)
++		{
++			if (view == null || !linked)
++			{
++				if (!linked)
++				{
++					Reset();
++				}
++				return;
++			}
++			if (inFlight != null)
++			{
++				if (!view.CommandIdle)
++				{
++					return;
++				}
++				inFlight = null;
++			}
++			if (waiting.Count == 0)
++			{
++				return;
++			}
++			string cmd = waiting.Peek();
++			if (view.PushCommand(cmd))
++			{
++				waiting.Dequeue();
++				inFlight = cmd;
++				Plugin.Log.LogInfo("SubCraft command -> Minecraft: " + cmd);
++			}
++		}
++	}
++}
+diff --git a/host-subnautica/src/Link/LinkView.cs b/host-subnautica/src/Link/LinkView.cs
+index 2475674..afe74a1 100644
+--- a/host-subnautica/src/Link/LinkView.cs
++++ b/host-subnautica/src/Link/LinkView.cs
+@@ -313,6 +313,39 @@ namespace SubCraft.Link
+ 			I64Release(o + Proto.IrHead, inputHead);
+ 		}
+ 
++		// ---- command box (produce): host -> MC debug commands, mirrors tools/mc_cmd.py ----
++		//
++		// Added for the item bridge (thatg's PC, 2026-10-09). The guest polls this box and runs the
++		// text as a Minecraft command (text starting with "/") or a SubCraft command ("subcraft ...").
++		// One command in flight at a time: seq is bumped, the guest acks with the same value.
++		private uint commandSeq;
++
++		public bool CommandIdle => commandSeq == 0 || U32(Proto.OffCommandBox + Proto.CbAck) == commandSeq;
++
++		public uint LastCommandSeq => commandSeq;
++
++		/// <summary>Queues one command for Minecraft. Returns false while the previous one is unacked
++		/// (or the text is too long); the caller retries on a later frame.</summary>
++		public bool PushCommand(string text)
++		{
++			if (text == null) return false;
++			long o = Proto.OffCommandBox;
++			uint ack = U32(o + Proto.CbAck);
++			if (commandSeq != 0 && ack != commandSeq) return false;   // previous still running
++			byte[] bytes = Encoding.UTF8.GetBytes(text);
++			if (bytes.Length > Proto.CommandTextBytes) return false;
++			fixed (byte* src = bytes)
++			{
++				byte* dst = b + o + Proto.CbText;
++				for (int i = 0; i < bytes.Length; i++) dst[i] = src[i];
++				dst[bytes.Length] = 0;
++			}
++			Put(o + Proto.CbTextLen, (uint)bytes.Length);
++			commandSeq = ack + 1;
++			Put(o + Proto.CbSeq, commandSeq);
++			return true;
++		}
++
+ 		// ---- event ring (consume) ----
+ 
+ 		public struct McEvent
+diff --git a/host-subnautica/src/LinkDriver.cs b/host-subnautica/src/LinkDriver.cs
+index 8c9a02a..56dd2a9 100644
+--- a/host-subnautica/src/LinkDriver.cs
++++ b/host-subnautica/src/LinkDriver.cs
+@@ -67,6 +67,8 @@ namespace SubCraft
+ 				{
+ 					Harvester.Reset(view);
+ 					Dry.Reset();
++					SubCraft.Link.GuestCommands.Reset();
++					World.WorldAnchor.Reset();
+ 					RequestTeleport("link up");
+ 				}
+ 				else
+@@ -121,8 +123,11 @@ namespace SubCraft
+ 				Dry.Frame(view, Harvester.Epoch, global::Player.main.transform.position);
+ 			}
+ 			World.LifepodAnchor.Frame(McLinked && inGame);
++			World.WorldAnchor.Frame(McLinked && inGame);
++			SubCraft.Link.GuestCommands.Frame(view, McLinked);
+ 			Combat.CreatureLink.Frame(view, McLinked && inGame);
+ 			Combat.MobStandIns.Frame(view, McLinked && inGame);
++			Items.ItemBridge.Frame(view, McLinked && inGame);
+ 			PlayerPuppet.Frame(this);
+ 			Audio.SoundBridge.Frame();
+ 			Hud.SurvivalDials.Frame();
+diff --git a/host-subnautica/src/Player/InputCapture.cs b/host-subnautica/src/Player/InputCapture.cs
+index 802fd1b..35bc35a 100644
+--- a/host-subnautica/src/Player/InputCapture.cs
++++ b/host-subnautica/src/Player/InputCapture.cs
+@@ -12,7 +12,10 @@ namespace SubCraft.Player
+ 	public static class InputCapture
+ 	{
+ 		private static readonly int[] Keys = BuildKeys();
+-		private static readonly HashSet<int> HostOnly = new HashSet<int> { (int)KeyCode.Tab, (int)KeyCode.Escape };
++		// Local patch (thatg's PC, 2026-10-09): F11 used to be forwarded, so it toggled Minecraft's
++		// fullscreen and popped the hidden guest window on top of Subnautica (the guest only hid its
++		// window once; it now re-hides every tick as well). F11 stays out of Minecraft entirely.
++		private static readonly HashSet<int> HostOnly = new HashSet<int> { (int)KeyCode.Tab, (int)KeyCode.Escape, (int)KeyCode.F11 };
+ 		private static readonly HashSet<int> HeldKeys = new HashSet<int>();
+ 		private static readonly bool[] HeldButtons = new bool[5];
+ 		private static bool routing;
+@@ -37,6 +40,12 @@ namespace SubCraft.Player
+ 				return;
+ 			}
+ 			routing = true;
++			// F11 belongs to the host game (see HostOnly): toggle Subnautica's fullscreen instead of
++			// letting Minecraft's fullscreen pop its hidden window on top.
++			if (Input.GetKeyDown(KeyCode.F11))
++			{
++				ToggleGameFullscreen();
++			}
+ 			int mods = KeyMap.GlfwMods(
+ 				Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift),
+ 				Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl),
+@@ -106,5 +115,34 @@ namespace SubCraft.Player
+ 		{
+ 			view.PushInput(Proto.InKey, (ushort)glfwKey, down ? 1 : 0, 0, 0);
+ 		}
++
++		/// <summary>
++		/// Local patch (thatg's PC, 2026-10-09, requested): F11 toggles the host game's fullscreen.
++		/// Borderless fullscreen on the way in; Unity restores the remembered windowed size on the way
++		/// out. Never throws into the input path.
++		/// </summary>
++		public static void ToggleGameFullscreen()
++		{
++			try
++			{
++				bool now = Screen.fullScreen;
++				if (now)
++				{
++					Screen.fullScreenMode = FullScreenMode.Windowed;
++					Screen.fullScreen = false;
++				}
++				else
++				{
++					Screen.fullScreenMode = FullScreenMode.FullScreenWindow;
++					Screen.fullScreen = true;
++				}
++				Plugin.Log?.LogInfo("SubCraft: F11 -> fullscreen " + (!now) +
++					" (" + Screen.width + "x" + Screen.height + " " + Screen.fullScreenMode + ")");
++			}
++			catch (System.Exception e)
++			{
++				Plugin.Log?.LogWarning("SubCraft: F11 fullscreen toggle failed: " + e.Message);
++			}
++		}
+ 	}
+ }
+diff --git a/host-subnautica/src/World/WorldAnchor.cs b/host-subnautica/src/World/WorldAnchor.cs
+new file mode 100644
+index 0000000..aabc8cf
+--- /dev/null
++++ b/host-subnautica/src/World/WorldAnchor.cs
+@@ -0,0 +1,69 @@
++using SubCraft.Link;
++using UnityEngine;
++
++namespace SubCraft.World
++{
++	/// <summary>
++	/// Anchors Minecraft's spawn to Subnautica's own spawn point (the lifepod), so dying and respawning
++	/// in Minecraft never drops the player into the void below the world.
++	///
++	/// Requested by the player 2026-10-09: the dev world's default spawn sits under the water column
++	/// (the world spans y = -2032..255), so the Minecraft player respawned at the bottom and died of
++	/// "outOfWorld" over and over. Subnautica already knows where a player starts, so we read it and
++	/// hand it to Minecraft through the link's command box.
++	/// </summary>
++	public static class WorldAnchor
++	{
++		private static bool sent;
++
++		public static void Reset()
++		{
++			sent = false;
++		}
++
++		public static void Frame(bool inGame)
++		{
++			if (sent || !inGame)
++			{
++				return;
++			}
++			Vector3 spawn;
++			if (!TrySpawn(out spawn))
++			{
++				return;
++			}
++			int x = Mathf.FloorToInt(spawn.x);
++			int y = Mathf.FloorToInt(spawn.y) + 1;   // stand on the floor, not in it
++			int z = Mathf.FloorToInt(-spawn.z);      // Unity -> Minecraft: z is mirrored
++			GuestCommands.Enqueue("/setworldspawn " + x + " " + y + " " + z);
++			GuestCommands.Enqueue("/spawnpoint @s " + x + " " + y + " " + z);
++			sent = true;
++			Plugin.Log.LogInfo("SubCraft spawn: Minecraft spawn anchored at Subnautica's (" + x + ", " + y + ", " + z + ")");
++		}
++
++		private static bool TrySpawn(out Vector3 position)
++		{
++			position = Vector3.zero;
++			try
++			{
++				EscapePod pod = EscapePod.main;
++				if (pod != null && pod.playerSpawn != null)
++				{
++					position = pod.playerSpawn.position;
++					return true;
++				}
++				global::Player player = global::Player.main;
++				if (player != null && player.transform != null)
++				{
++					position = player.transform.position;
++					return true;
++				}
++			}
++			catch (System.Exception e)
++			{
++				Plugin.Log.LogWarning("SubCraft spawn: cannot read Subnautica's spawn point: " + e.Message);
++			}
++			return false;
++		}
++	}
++}

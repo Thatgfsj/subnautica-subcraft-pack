@@ -1,0 +1,24 @@
+Steam launch options for SubCraft x Subnautica
+==============================================
+
+Paste the line below into:
+
+    Steam -> Library -> right-click "Subnautica" -> Properties -> General -> Launch Options
+    (the box that says "高级用户可以选择输入对启动选项的修改")
+
+    cmd /c start "" "<GAME_DIR>\SubCraft\start-mc.cmd" & %command%
+
+
+What it does
+------------
+* starts your Minecraft launcher first (edit MC_LAUNCH in start-mc.cmd if the path is wrong),
+* then starts Subnautica as usual (%command% is Steam's own game command).
+
+Minecraft hides its own window, opens the SubCraft world and waits; when you load a save in
+Subnautica the two link up and the Minecraft character takes over.
+
+
+Note on the path
+----------------
+install.ps1 writes a ready-to-paste file named steam-launch-options.txt next to itself,
+with <GAME_DIR> already replaced by your real install path. Use that one.
